@@ -314,27 +314,38 @@ function DoubanPageClient() {
   // 生成API请求参数的辅助函数
   const getRequestParams = useCallback(
     (pageStart: number) => {
+      // 应用映射: 中文 -> 英文
+      const safeCategory =
+        CATEGORY_MAPPING[primarySelection] || primarySelection;
+      const safeType = TYPE_MAPPING[secondarySelection] || secondarySelection;
+
       // 当type为tv或show时，kind统一为'tv'，category使用type本身
       if (type === 'tv' || type === 'show') {
         return {
           kind: 'tv' as const,
           category: type,
-          type: secondarySelection,
+          type: safeType,
           pageLimit: 50,
           pageStart,
         };
       }
 
-      // 电影类型保持原逻辑
+      // 电影类型使用映射后的参数
       return {
         kind: type as 'tv' | 'movie',
-        category: primarySelection,
-        type: secondarySelection,
+        category: safeCategory,
+        type: safeType,
         pageLimit: 50,
         pageStart,
       };
     },
-    [type, primarySelection, secondarySelection],
+    [
+      type,
+      primarySelection,
+      secondarySelection,
+      CATEGORY_MAPPING,
+      TYPE_MAPPING,
+    ],
   );
 
   // 防抖的数据加载函数 - 缓存优先
@@ -507,35 +518,35 @@ function DoubanPageClient() {
   const fetchMoreData = useCallback(async () => {
     // 防止重复请求
     if (isLoadingMore || !hasMore) {
-      console.log(
-        '⏸️ [fetchMoreData] Skipped: isLoadingMore=',
-        isLoadingMore,
-        'hasMore=',
-        hasMore,
-      );
       return;
     }
 
-    setIsLoadingMore(true);
+    // 1. 创建快照
+    const requestSnapshot = {
+      type,
+      primarySelection,
+      secondarySelection,
+      multiLevelSelection: multiLevelValues,
+      selectedWeekday,
+      currentPage: currentPage + 1,
+    };
+
+    // 2. 关键修复: 立即更新 ref 防止竞态条件
+    currentParamsRef.current = {
+      type: requestSnapshot.type,
+      primarySelection: requestSnapshot.primarySelection,
+      secondarySelection: requestSnapshot.secondarySelection,
+      multiLevelSelection: requestSnapshot.multiLevelSelection,
+      selectedWeekday: requestSnapshot.selectedWeekday,
+    };
 
     try {
-      // 使用映射后的安全参数
-      const safeCategory =
-        CATEGORY_MAPPING[primarySelection] || primarySelection;
-      const safeType = TYPE_MAPPING[secondarySelection] || secondarySelection;
-
-      console.log(
-        '🔄 [fetchMoreData] Loading page',
-        currentPage + 1,
-        'with category:',
-        safeCategory,
-        'type:',
-        safeType,
-      );
+      setIsLoadingMore(true);
 
       let data: DoubanResult;
-      const pageStart = (currentPage + 1) * 50;
+      const pageStart = requestSnapshot.currentPage * 50;
 
+      // 3. 使用映射后的参数获取数据
       if (type === 'custom') {
         const selectedCategory = customCategories.find(
           (cat) =>
@@ -581,28 +592,37 @@ function DoubanPageClient() {
           label: multiLevelValues.label || '',
         });
       } else {
-        // 使用映射后的参数
-        data = await getDoubanCategories({
-          kind:
-            type === 'tv' || type === 'show' ? 'tv' : (type as 'tv' | 'movie'),
-          category: type === 'tv' || type === 'show' ? type : safeCategory,
-          type: safeType,
-          pageLimit: 50,
-          pageStart,
-        });
+        // 使用 getRequestParams 获取已映射的参数
+        data = await getDoubanCategories(getRequestParams(pageStart));
       }
 
       if (data.code === 200) {
-        // SmoneTV 模式: 直接追加数据，不做复杂检查
-        console.log(
-          '✅ [fetchMoreData] Got',
-          data.list.length,
-          'items, appending to',
-          doubanData.length,
-        );
-        setDoubanData((prev) => [...prev, ...data.list]);
-        setHasMore(data.list.length >= 50); // 如果返回满页，可能还有更多
-        setCurrentPage((prev) => prev + 1);
+        // 4. 宽松验证: 只检查关键筛选条件
+        const currentSnapshot = { ...currentParamsRef.current };
+        const isMatch =
+          requestSnapshot.type === currentSnapshot.type &&
+          requestSnapshot.primarySelection ===
+            currentSnapshot.primarySelection &&
+          requestSnapshot.secondarySelection ===
+            currentSnapshot.secondarySelection;
+
+        // 5. 直接追加数据，信任 React key 处理重复
+        if (isMatch && data.list.length > 0) {
+          console.log(
+            '✅ [fetchMoreData] Appending',
+            data.list.length,
+            'items to existing',
+            doubanData.length,
+          );
+          setDoubanData((prev) => [...prev, ...data.list]);
+          setHasMore(data.list.length >= 50);
+          setCurrentPage((prev) => prev + 1);
+        } else if (!isMatch) {
+          console.log('⚠️ [fetchMoreData] Filter changed, discarding data');
+        } else {
+          console.log('ℹ️ [fetchMoreData] No more data');
+          setHasMore(false);
+        }
       } else {
         console.error('❌ [fetchMoreData] API error:', data.message);
         setHasMore(false);
@@ -621,10 +641,10 @@ function DoubanPageClient() {
     primarySelection,
     secondarySelection,
     multiLevelValues,
+    selectedWeekday,
     customCategories,
     doubanData.length,
-    CATEGORY_MAPPING,
-    TYPE_MAPPING,
+    getRequestParams,
   ]);
 
   // VirtualGrid 触底回调 - 触发加载更多
